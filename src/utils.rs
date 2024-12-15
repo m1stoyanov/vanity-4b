@@ -1,6 +1,5 @@
 use std::io::Write;
 
-use const_hex::encode;
 use log::info;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tiny_keccak::{Hasher, Keccak};
@@ -12,6 +11,21 @@ pub fn calculate_keccak_256(input: &[u8]) -> [u8; 32] {
     hasher.update(input);
     hasher.finalize(&mut output);
     output
+}
+
+#[inline]
+fn hex_to_val(c: u8) -> u8 {
+    match c {
+        b'0'..=b'9' => c - b'0',
+        b'a'..=b'f' => c - b'a' + 10,
+        b'A'..=b'F' => c - b'A' + 10,
+        _ => panic!("Invalid hex character"),
+    }
+}
+
+#[inline]
+fn nibble_matches(byte: u8, pattern_hi: u8, pattern_lo: u8) -> bool {
+    (byte >> 4) == hex_to_val(pattern_hi) && (byte & 0x0F) == hex_to_val(pattern_lo)
 }
 
 pub fn generate_vanity_function_name(pattern: &[u8], name: &[u8], parameters: &[u8]) {
@@ -35,10 +49,18 @@ pub fn generate_vanity_function_name(pattern: &[u8], name: &[u8], parameters: &[
 
         let hash = calculate_keccak_256(&buffer);
 
-        // Compare with pattern - only convert to hex if needed
-        if encode(&hash[..4]).as_bytes().starts_with(pattern) {
+        // Compare hash bytes directly with pattern
+        if hash
+            .iter()
+            .take(4)
+            .zip(pattern.chunks(2))
+            .all(|(byte, pattern_pair)| nibble_matches(*byte, pattern_pair[0], pattern_pair[1]))
+        {
             let function_name = std::str::from_utf8(&buffer).unwrap();
-            let signature = format!("0x{}", encode(&hash[..4]));
+            let signature = format!(
+                "0x{:02x}{:02x}{:02x}{:02x}",
+                hash[0], hash[1], hash[2], hash[3]
+            );
 
             info!("Vanity function name found:");
             info!("Signature: {}", signature);
