@@ -9,12 +9,7 @@ mod utils;
 #[derive(Debug, Options, Clone)]
 pub struct Opts {
     pub help: bool,
-    #[options(
-        help = "Desired pattern, e.g., \"0x01234\"",
-        required,
-        short = "x",
-        meta = ""
-    )]
+    #[options(help = "Desired pattern, e.g., \"0x01234\"", required, short = "x", meta = "")]
     pub pattern: String,
     #[options(
         help = "Function name, e.g., \"checkAddressInfo\"",
@@ -37,11 +32,7 @@ fn main() {
 
     // Strip '0x' if pattern starts with it
     let pattern = opts.pattern.as_bytes();
-    let pattern_without_prefix = if pattern.starts_with(b"0x") {
-        &pattern[2..]
-    } else {
-        pattern
-    };
+    let pattern_without_prefix = if pattern.starts_with(b"0x") { &pattern[2..] } else { pattern };
 
     let fn_name = &opts.fn_name;
     let fn_parameters = &opts.fn_parameters.unwrap_or_default();

@@ -57,10 +57,8 @@ pub fn generate_vanity_function_name(pattern: &[u8], name: &[u8], parameters: &[
             .all(|(byte, pattern_pair)| nibble_matches(*byte, pattern_pair[0], pattern_pair[1]))
         {
             let function_name = std::str::from_utf8(&buffer).unwrap();
-            let signature = format!(
-                "0x{:02x}{:02x}{:02x}{:02x}",
-                hash[0], hash[1], hash[2], hash[3]
-            );
+            let signature =
+                format!("0x{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
 
             info!("Vanity function name found:");
             info!("Signature: {}", signature);
