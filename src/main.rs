@@ -44,5 +44,7 @@ fn main() {
 
     utils::generate_vanity_function_name(pattern, fn_name, fn_parameters);
 
-    info!("Elapsed time {} seconds", instant.elapsed().as_secs());
+    let elapsed = instant.elapsed().as_millis() as f64;
+    let elapsed_seconds = elapsed / 1000.0;
+    info!("Elapsed time {} seconds", elapsed_seconds);
 }
