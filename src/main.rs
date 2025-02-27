@@ -2,7 +2,7 @@ use std::{sync::atomic::Ordering, time::Instant};
 
 use gumdrop::Options;
 use log::{error, info};
-use vanity_4b::{generate_vanity_function_name, HASH_COUNTER, HEX_LOOKUP_TABLE};
+use vanity_4b::{HASH_COUNTER, HEX_LOOKUP_TABLE, generate_vanity_function_name};
 
 // CLI Options
 #[derive(Debug, Options, Clone)]
@@ -23,6 +23,12 @@ pub struct Opts {
         meta = ""
     )]
     pub fn_parameters: Option<String>,
+    #[options(
+        help = "Number of CPU cores to use (default: half of all cores)",
+        short = "c",
+        meta = ""
+    )]
+    pub num_cores: Option<usize>,
 }
 
 fn main() {
@@ -49,6 +55,7 @@ fn main() {
         pattern_without_prefix.as_bytes(),
         fn_name.as_bytes(),
         fn_parameters.as_bytes(),
+        opts.num_cores,
     );
 
     let elapsed = instant.elapsed().as_millis() as f64;

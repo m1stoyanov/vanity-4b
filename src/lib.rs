@@ -39,7 +39,21 @@ fn nibble_matches(byte: u8, pattern_hi: u8, pattern_lo: u8) -> bool {
         && (byte & 0x0F) == HEX_LOOKUP_TABLE[pattern_lo as usize]
 }
 
-pub fn generate_vanity_function_name(pattern: &[u8], name: &[u8], parameters: &[u8]) {
+// Compare hash bytes with pattern
+#[inline]
+fn compare_hash(hash: [u8; 32], pattern: &[u8]) -> bool {
+    hash.iter()
+        .take(4)
+        .zip(pattern.chunks(2))
+        .all(|(byte, pattern_pair)| nibble_matches(*byte, pattern_pair[0], pattern_pair[1]))
+}
+
+pub fn generate_vanity_function_name(
+    pattern: &[u8],
+    name: &[u8],
+    parameters: &[u8],
+    num_cores: Option<usize>,
+) {
     // Pre-allocate prefix and suffix buffers
     // First is just the name
     let prefix_buffer = name;
@@ -48,6 +62,26 @@ pub fn generate_vanity_function_name(pattern: &[u8], name: &[u8], parameters: &[
     suffix_buffer.push(b'(');
     suffix_buffer.extend_from_slice(parameters);
     suffix_buffer.push(b')');
+
+    // Configure thread pool
+    let available_cores = num_cpus::get();
+    let cores_to_use = match num_cores {
+        Some(cores) => cores,
+        None => {
+            if available_cores > 1 {
+                available_cores / 2
+            } else {
+                1
+            }
+        }
+    };
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(cores_to_use)
+        .build_global()
+        .expect("Failed to build thread pool");
+
+    info!("Using {} of {} available cores for processing", cores_to_use, available_cores);
 
     // Use thread-local buffer to avoid allocations
     thread_local! {
@@ -67,17 +101,11 @@ pub fn generate_vanity_function_name(pattern: &[u8], name: &[u8], parameters: &[
             let hash = calculate_keccak_256(&buffer);
 
             // Increment hash counter (less frequently to reduce atomic contention)
-            if (num & 0x3FF) == 0 {
-                HASH_COUNTER.fetch_add(1024, Ordering::Relaxed);
+            if (num & 0xFFFFF) == 0 {
+                HASH_COUNTER.fetch_add(1048575, Ordering::Relaxed);
             }
 
-            // Compare hash bytes directly with pattern
-            if hash
-                .iter()
-                .take(4)
-                .zip(pattern.chunks(2))
-                .all(|(byte, pattern_pair)| nibble_matches(*byte, pattern_pair[0], pattern_pair[1]))
-            {
+            if compare_hash(hash, pattern) {
                 let function_name = std::str::from_utf8(&buffer).unwrap();
                 let signature =
                     format!("0x{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
