@@ -34,18 +34,77 @@ pub fn calculate_keccak_256(input: &[u8]) -> [u8; 32] {
 }
 
 #[inline]
-fn nibble_matches(byte: u8, pattern_hi: u8, pattern_lo: u8) -> bool {
-    (byte >> 4) == HEX_LOOKUP_TABLE[pattern_hi as usize]
-        && (byte & 0x0F) == HEX_LOOKUP_TABLE[pattern_lo as usize]
-}
-
-// Compare hash bytes with pattern
-#[inline]
 fn compare_hash(hash: [u8; 32], pattern: &[u8]) -> bool {
-    hash.iter()
-        .take(4)
-        .zip(pattern.chunks(2))
-        .all(|(byte, pattern_pair)| nibble_matches(*byte, pattern_pair[0], pattern_pair[1]))
+    // Pattern is already validated so we dont check for != 0xFF
+    match pattern.len() {
+        0 => {
+            // Empty pattern matches everything
+            true
+        }
+        1 => {
+            // Single hex character (high nibble of first byte)
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+        }
+        2 => {
+            // First byte only
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+                && (hash[0] & 0x0F) == HEX_LOOKUP_TABLE[pattern[1] as usize]
+        }
+        3 => {
+            // First byte + high nibble of second
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+                && (hash[0] & 0x0F) == HEX_LOOKUP_TABLE[pattern[1] as usize]
+                && (hash[1] >> 4) == HEX_LOOKUP_TABLE[pattern[2] as usize]
+        }
+        4 => {
+            // First two bytes
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+                && (hash[0] & 0x0F) == HEX_LOOKUP_TABLE[pattern[1] as usize]
+                && (hash[1] >> 4) == HEX_LOOKUP_TABLE[pattern[2] as usize]
+                && (hash[1] & 0x0F) == HEX_LOOKUP_TABLE[pattern[3] as usize]
+        }
+        5 => {
+            // Two bytes + high nibble of third
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+                && (hash[0] & 0x0F) == HEX_LOOKUP_TABLE[pattern[1] as usize]
+                && (hash[1] >> 4) == HEX_LOOKUP_TABLE[pattern[2] as usize]
+                && (hash[1] & 0x0F) == HEX_LOOKUP_TABLE[pattern[3] as usize]
+                && (hash[2] >> 4) == HEX_LOOKUP_TABLE[pattern[4] as usize]
+        }
+        6 => {
+            // Three bytes
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+                && (hash[0] & 0x0F) == HEX_LOOKUP_TABLE[pattern[1] as usize]
+                && (hash[1] >> 4) == HEX_LOOKUP_TABLE[pattern[2] as usize]
+                && (hash[1] & 0x0F) == HEX_LOOKUP_TABLE[pattern[3] as usize]
+                && (hash[2] >> 4) == HEX_LOOKUP_TABLE[pattern[4] as usize]
+                && (hash[2] & 0x0F) == HEX_LOOKUP_TABLE[pattern[5] as usize]
+        }
+        7 => {
+            // Three bytes + high nibble of fourth
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+                && (hash[0] & 0x0F) == HEX_LOOKUP_TABLE[pattern[1] as usize]
+                && (hash[1] >> 4) == HEX_LOOKUP_TABLE[pattern[2] as usize]
+                && (hash[1] & 0x0F) == HEX_LOOKUP_TABLE[pattern[3] as usize]
+                && (hash[2] >> 4) == HEX_LOOKUP_TABLE[pattern[4] as usize]
+                && (hash[2] & 0x0F) == HEX_LOOKUP_TABLE[pattern[5] as usize]
+                && (hash[3] >> 4) == HEX_LOOKUP_TABLE[pattern[6] as usize]
+        }
+        8 => {
+            // Four bytes (most common case)
+            (hash[0] >> 4) == HEX_LOOKUP_TABLE[pattern[0] as usize]
+                && (hash[0] & 0x0F) == HEX_LOOKUP_TABLE[pattern[1] as usize]
+                && (hash[1] >> 4) == HEX_LOOKUP_TABLE[pattern[2] as usize]
+                && (hash[1] & 0x0F) == HEX_LOOKUP_TABLE[pattern[3] as usize]
+                && (hash[2] >> 4) == HEX_LOOKUP_TABLE[pattern[4] as usize]
+                && (hash[2] & 0x0F) == HEX_LOOKUP_TABLE[pattern[5] as usize]
+                && (hash[3] >> 4) == HEX_LOOKUP_TABLE[pattern[6] as usize]
+                && (hash[3] & 0x0F) == HEX_LOOKUP_TABLE[pattern[7] as usize]
+        }
+        _ => {
+            panic!("Pattern longer than 4 bytes! This should never happen!");
+        }
+    }
 }
 
 pub fn generate_vanity_function_name(
