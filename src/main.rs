@@ -1,7 +1,7 @@
 use std::{sync::atomic::Ordering, time::Instant};
 
 use gumdrop::Options;
-use log::{error, info};
+use log::{error, info, warn};
 use vanity_4b::{HASH_COUNTER, HEX_LOOKUP_TABLE, generate_vanity_function_name};
 
 // CLI Options
@@ -37,13 +37,24 @@ fn main() {
 
     // Lower case and strip '0x' if pattern starts with it
     let pattern = opts.pattern.to_lowercase();
-    let pattern_without_prefix = pattern.strip_prefix("0x").unwrap_or(&pattern);
+    let mut pattern_without_prefix = pattern.strip_prefix("0x").unwrap_or(&pattern);
 
-    // Validate pattern (every char should be in 0123456789abcdef range)
+    // Validate pattern
+    // It should be <= 8 chars
+    if pattern_without_prefix.len() > 8 {
+        let truncated_pattern_without_prefix = &pattern_without_prefix[..8];
+        warn!(
+            "Pattern {} has invalid lenght. Truncating to 0x{}",
+            opts.pattern, truncated_pattern_without_prefix
+        );
+        pattern_without_prefix = truncated_pattern_without_prefix;
+    }
+    // Every char should be in 0123456789abcdef range
     if !pattern_without_prefix.chars().all(|c| HEX_LOOKUP_TABLE[c as usize] != 0xFF) {
         error!("Pattern {} has invalid characters!", opts.pattern);
         std::process::exit(1);
     }
+    // Done validating pattern
 
     let fn_name = &opts.fn_name;
     let fn_parameters = &opts.fn_parameters.unwrap_or_default();
