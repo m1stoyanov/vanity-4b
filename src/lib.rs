@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use log::info;
+use log::{info, warn};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tiny_keccak::{Hasher, Keccak};
 
@@ -166,13 +166,25 @@ pub fn generate_vanity_function_name(
 
             if compare_hash(hash, pattern) {
                 let function_name = std::str::from_utf8(&buffer).unwrap();
+                let function_name_hash = calculate_keccak_256(function_name.as_bytes());
                 let signature =
                     format!("0x{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
 
                 info!("Vanity function name found:");
                 info!("Signature: {}", signature);
                 info!("Function name: {}", function_name);
-                true
+                // Verify result
+                if function_name_hash == hash {
+                    true
+                } else {
+                    warn!("Result did not pass verification!");
+                    warn!(
+                        "Candidate {:?} does not match {:?}",
+                        &hash[..4],
+                        &function_name_hash[..4]
+                    );
+                    false
+                }
             } else {
                 false
             }
