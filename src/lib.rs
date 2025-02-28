@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use log::{info, warn};
+use log::warn;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use tiny_keccak::{Hasher, Keccak};
 
@@ -111,8 +111,9 @@ pub fn generate_vanity_function_name(
     pattern: &[u8],
     name: &[u8],
     parameters: &[u8],
-    num_cores: Option<usize>,
-) {
+    range_start: u64,
+    end: Option<u64>,
+) -> Option<u64> {
     // Pre-allocate prefix and suffix buffers
     // First is just the name
     let prefix_buffer = name;
@@ -122,32 +123,14 @@ pub fn generate_vanity_function_name(
     suffix_buffer.extend_from_slice(parameters);
     suffix_buffer.push(b')');
 
-    // Configure thread pool
-    let available_cores = num_cpus::get();
-    let cores_to_use = match num_cores {
-        Some(cores) => cores,
-        None => {
-            if available_cores > 1 {
-                available_cores / 2
-            } else {
-                1
-            }
-        }
-    };
-
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(cores_to_use)
-        .build_global()
-        .expect("Failed to build thread pool");
-
-    info!("Using {} of {} available cores for processing", cores_to_use, available_cores);
-
     // Use thread-local buffer to avoid allocations
     thread_local! {
         static THREAD_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(0));
     }
 
-    (0_u64..u64::MAX).into_par_iter().find_any(|&num| {
+    let range_end = end.unwrap_or(u64::MAX);
+
+    (range_start..range_end).into_par_iter().find_any(|&num| {
         THREAD_BUFFER.with(|buffer| {
             let mut buffer = buffer.borrow_mut();
             buffer.clear();
@@ -167,12 +150,7 @@ pub fn generate_vanity_function_name(
             if compare_hash(hash, pattern) {
                 let function_name = std::str::from_utf8(&buffer).unwrap();
                 let function_name_hash = calculate_keccak_256(function_name.as_bytes());
-                let signature =
-                    format!("0x{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
 
-                info!("Vanity function name found:");
-                info!("Signature: {}", signature);
-                info!("Function name: {}", function_name);
                 // Verify result
                 if function_name_hash == hash {
                     true
@@ -189,5 +167,5 @@ pub fn generate_vanity_function_name(
                 false
             }
         })
-    });
+    })
 }

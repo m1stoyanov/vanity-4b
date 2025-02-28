@@ -2,7 +2,9 @@ use std::{sync::atomic::Ordering, time::Instant};
 
 use gumdrop::Options;
 use log::{error, info, warn};
-use vanity_4b::{HASH_COUNTER, HEX_LOOKUP_TABLE, generate_vanity_function_name};
+use vanity_4b::{
+    HASH_COUNTER, HEX_LOOKUP_TABLE, calculate_keccak_256, generate_vanity_function_name,
+};
 
 // CLI Options
 #[derive(Debug, Options, Clone)]
@@ -24,16 +26,25 @@ pub struct Opts {
     )]
     pub fn_parameters: Option<String>,
     #[options(
-        help = "Number of CPU cores to use (default: half of all cores)",
-        short = "c",
+        help = "Number of threads to use (default: number of physical cores)",
+        short = "t",
         meta = ""
     )]
-    pub num_cores: Option<usize>,
+    pub num_threads: Option<usize>,
 }
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let opts = Opts::parse_args_default_or_exit();
+
+    // Configure thread pool
+    let available_cores = num_cpus::get_physical();
+    let threads_to_use = opts.num_threads.unwrap_or(available_cores);
+
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads_to_use)
+        .build_global()
+        .expect("Failed to build thread pool");
 
     // Lower case and strip '0x' if pattern starts with it
     let pattern = opts.pattern.to_lowercase();
@@ -60,14 +71,37 @@ fn main() {
     let fn_parameters = &opts.fn_parameters.unwrap_or_default();
     let full_name = format!("{}({})", fn_name, fn_parameters);
     info!("Start searching vanity function name for {}", full_name);
+    info!("Using {} threads on {} physical cores for processing", threads_to_use, available_cores);
+
     let instant = Instant::now();
 
-    generate_vanity_function_name(
-        pattern_without_prefix.as_bytes(),
-        fn_name.as_bytes(),
-        fn_parameters.as_bytes(),
-        opts.num_cores,
-    );
+    let step = 1_000_000_000_u64;
+    for starting_point in (0..u64::MAX).step_by(step as usize) {
+        let ending_point = starting_point.saturating_add(step);
+        info!("Range: [{}..{}]", starting_point, ending_point);
+        match generate_vanity_function_name(
+            pattern_without_prefix.as_bytes(),
+            fn_name.as_bytes(),
+            fn_parameters.as_bytes(),
+            starting_point,
+            Some(ending_point),
+        ) {
+            Some(solution_index) => {
+                let vanity_function_name =
+                    format!("{}{}({})", fn_name, solution_index, fn_parameters);
+                let hash = calculate_keccak_256(vanity_function_name.as_bytes());
+                let signature =
+                    format!("0x{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
+                info!("Vanity function name found:");
+                info!("Signature: {}", signature);
+                info!("Function name: {}", vanity_function_name);
+                break;
+            }
+            None => {
+                warn!("Did not find solution");
+            }
+        }
+    }
 
     let elapsed = instant.elapsed().as_millis() as f64;
     let elapsed_seconds = elapsed / 1000.0;
