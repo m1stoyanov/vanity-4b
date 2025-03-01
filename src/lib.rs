@@ -1,11 +1,8 @@
-use std::{
-    io::Write,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use keccak_asm::Digest;
 use log::warn;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use tiny_keccak::{Hasher, Keccak};
 
 pub const HEX_LOOKUP_TABLE: [u8; 256] = {
     let mut table = [0xFFu8; 256]; // Default all values to 0xFF (invalid)
@@ -26,10 +23,9 @@ pub static HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn calculate_keccak_256(input: &[u8]) -> [u8; 32] {
-    let mut output = [0u8; 32];
-    let mut hasher = Keccak::v256();
+    let mut hasher = keccak_asm::Keccak256::new();
     hasher.update(input);
-    hasher.finalize(&mut output);
+    let output: [u8; 32] = hasher.finalize().into();
     output
 }
 
@@ -126,6 +122,7 @@ pub fn generate_vanity_function_name(
     // Use thread-local buffer to avoid allocations
     thread_local! {
         static THREAD_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(0));
+        static DIGIT_BUFFER: std::cell::RefCell<[u8; 20]> = const { std::cell::RefCell::new([0u8; 20]) };
     }
 
     let range_end = end.unwrap_or(u64::MAX);
@@ -135,9 +132,24 @@ pub fn generate_vanity_function_name(
             let mut buffer = buffer.borrow_mut();
             buffer.clear();
             buffer.extend_from_slice(prefix_buffer);
+
             if num > 0 {
-                write!(&mut buffer, "{}", num).unwrap();
+                DIGIT_BUFFER.with(|digits| {
+                    let mut digits = digits.borrow_mut();
+                    let mut n = num;
+                    let mut pos = 20;
+
+                    // Convert directly to ASCII digits
+                    while n > 0 {
+                        pos -= 1;
+                        digits[pos] = b'0' + (n % 10) as u8;
+                        n /= 10;
+                    }
+
+                    buffer.extend_from_slice(&digits[pos..20]);
+                });
             }
+
             buffer.extend_from_slice(&suffix_buffer);
 
             let hash = calculate_keccak_256(&buffer);
