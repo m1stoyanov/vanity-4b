@@ -3,35 +3,8 @@ use std::{sync::atomic::Ordering, time::Instant};
 use gumdrop::Options;
 use log::{error, info, warn};
 use vanity_4b::{
-    HASH_COUNTER, HEX_LOOKUP_TABLE, calculate_keccak_256, generate_vanity_function_name,
+    HASH_COUNTER, HEX_LOOKUP_TABLE, calculate_keccak_256, cli::Opts, generate_vanity_function_name,
 };
-
-// CLI Options
-#[derive(Debug, Options, Clone)]
-pub struct Opts {
-    pub help: bool,
-    #[options(help = "Desired pattern, e.g., \"0x01234\"", required, short = "x", meta = "")]
-    pub pattern: String,
-    #[options(
-        help = "Function name, e.g., \"checkAddressInfo\"",
-        required,
-        short = "f",
-        meta = ""
-    )]
-    pub fn_name: String,
-    #[options(
-        help = "Optional function parameters e.g., \"address,address,uint256\"",
-        short = "p",
-        meta = ""
-    )]
-    pub fn_parameters: Option<String>,
-    #[options(
-        help = "Number of threads to use (default: number of physical cores)",
-        short = "t",
-        meta = ""
-    )]
-    pub num_threads: Option<usize>,
-}
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();

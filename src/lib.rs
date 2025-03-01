@@ -4,6 +4,8 @@ use keccak_asm::Digest;
 use log::warn;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+pub mod cli;
+
 pub const HEX_LOOKUP_TABLE: [u8; 256] = {
     let mut table = [0xFFu8; 256]; // Default all values to 0xFF (invalid)
     let mut i = 0;
