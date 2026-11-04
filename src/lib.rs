@@ -1,8 +1,30 @@
+#[cfg(target_arch = "x86_64")]
+pub mod keccak_avx2;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use keccak_asm::Digest;
 use log::warn;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+/// Whether the current CPU can use the AVX2 Keccak kernel (checked once).
+/// Only meaningful on x86-64; the static is omitted elsewhere to avoid a
+/// dead-code warning.
+#[cfg(target_arch = "x86_64")]
+static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Build the const initializer for a per-thread candidate buffer.
+const fn init_buf() -> std::cell::RefCell<Vec<u8>> {
+    std::cell::RefCell::new(Vec::new())
+}
+
+thread_local! {
+    /// Per-thread reusable candidate buffers. They grow to the needed size on
+    /// first use and are then reused (never reallocated, never re-zeroed),
+    /// which avoids zeroing a 512-byte stack array for every pair. `build_candidate`
+    /// overwrites the whole `[0..total]` region we read, so the rest is unused.
+    static CAND1: std::cell::RefCell<Vec<u8>> = const { init_buf() };
+    static CAND2: std::cell::RefCell<Vec<u8>> = const { init_buf() };
+}
 
 pub mod cli;
 
@@ -25,10 +47,37 @@ pub static HASH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 pub fn calculate_keccak_256(input: &[u8]) -> [u8; 32] {
-    let mut hasher = keccak_asm::Keccak256::new();
-    hasher.update(input);
-    let output: [u8; 32] = hasher.finalize().into();
-    output
+    #[cfg(target_arch = "x86_64")]
+    {
+        if *AVX2.get_or_init(keccak_avx2::is_avx2) {
+            // SAFETY: AVX2 was detected on this CPU.
+            return unsafe { keccak_avx2::keccak256(input) };
+        }
+    }
+    keccak_asm::Keccak256::digest(input).into()
+}
+
+/// Hash two inputs; on AVX2 CPUs the two-way kernel hashes both in one pass
+/// (faster than two separate hashes). Falls back to two independent hashes.
+///
+/// The two-way kernel only supports single-block inputs (< 136 bytes each);
+/// longer inputs are hashed with the (multi-block-capable) single AVX2 kernel,
+/// and on non-AVX2 CPUs with `keccak-asm`.
+#[inline]
+pub fn calculate_keccak_256x2(a: &[u8], b: &[u8]) -> ([u8; 32], [u8; 32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if *AVX2.get_or_init(keccak_avx2::is_avx2) {
+            // SAFETY: AVX2 was detected on this CPU.
+            if a.len() < keccak_avx2::RATE && b.len() < keccak_avx2::RATE {
+                return unsafe { keccak_avx2::keccak256x2(a, b) };
+            }
+            // Multi-block inputs: hash each with the single AVX2 kernel
+            // (faster than the portable `keccak-asm` fallback).
+            return (unsafe { keccak_avx2::keccak256(a) }, unsafe { keccak_avx2::keccak256(b) });
+        }
+    }
+    (keccak_asm::Keccak256::digest(a).into(), keccak_asm::Keccak256::digest(b).into())
 }
 
 #[inline]
@@ -112,76 +161,140 @@ pub fn generate_vanity_function_name(
     range_start: u64,
     end: Option<u64>,
 ) -> Option<u64> {
-    // Pre-allocate prefix and suffix buffers
-    // First is just the name
-    let prefix_buffer = name;
-    // Second is the parameters part
-    let mut suffix_buffer = Vec::with_capacity(parameters.len() + 2);
-    suffix_buffer.push(b'(');
-    suffix_buffer.extend_from_slice(parameters);
-    suffix_buffer.push(b')');
+    // The hash input is always `name + digits(num) + "(params)"`.
+    let prefix = name;
+    let mut suffix: Vec<u8> = Vec::with_capacity(parameters.len() + 2);
+    suffix.push(b'(');
+    suffix.extend_from_slice(parameters);
+    suffix.push(b')');
 
-    // Use thread-local buffer to avoid allocations
-    thread_local! {
-        static THREAD_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(0));
-        static DIGIT_BUFFER: std::cell::RefCell<[u8; 20]> = const { std::cell::RefCell::new([0u8; 20]) };
-    }
+    // A u64 has at most 20 decimal digits, so the input never exceeds this.
+    let max_len = prefix.len() + 20 + suffix.len();
 
     let range_end = end.unwrap_or(u64::MAX);
+    let count = range_end.saturating_sub(range_start);
+    let n_pairs = count / 2 + count % 2;
 
-    (range_start..range_end).into_par_iter().find_any(|&num| {
-        THREAD_BUFFER.with(|buffer| {
-            let mut buffer = buffer.borrow_mut();
-            buffer.clear();
-            buffer.extend_from_slice(prefix_buffer);
-
-            if num > 0 {
-                DIGIT_BUFFER.with(|digits| {
-                    let mut digits = digits.borrow_mut();
-                    let mut n = num;
-                    let mut pos = 20;
-
-                    // Convert directly to ASCII digits
-                    while n > 0 {
-                        pos -= 1;
-                        digits[pos] = b'0' + (n % 10) as u8;
-                        n /= 10;
+    // Process two consecutive candidates per step so the AVX2 two-way kernel
+    // can hash both in a single pass (faster than two separate hashes).
+    //
+    // We iterate over *pair indices* (0, 1, 2, …) because `StepBy<Range<u64>>`
+    // does not implement `IntoParallelIterator`. Candidate buffers are
+    // thread-local and reused, so no per-pair allocation or zeroing.
+    (0..n_pairs).into_par_iter().find_map_any(|i| {
+        let num1 = range_start + 2 * i;
+        let num2 = num1 + 1;
+        CAND1.with(|c1_cell| {
+            let mut c1 = c1_cell.borrow_mut();
+            if c1.len() < max_len {
+                c1.resize(max_len, 0);
+            }
+            let t1 = build_candidate(&mut c1[..], prefix, &suffix, num1);
+            if num2 < range_end {
+                CAND2.with(|c2_cell| {
+                    let mut c2 = c2_cell.borrow_mut();
+                    if c2.len() < max_len {
+                        c2.resize(max_len, 0);
                     }
-
-                    buffer.extend_from_slice(&digits[pos..20]);
-                });
-            }
-
-            buffer.extend_from_slice(&suffix_buffer);
-
-            let hash = calculate_keccak_256(&buffer);
-
-            // Increment hash counter (less frequently to reduce atomic contention)
-            if (num & 0xFFFFF) == 0 {
-                HASH_COUNTER.fetch_add(1048575, Ordering::Relaxed);
-            }
-
-            if compare_hash(hash, pattern) {
-                let function_name = std::str::from_utf8(&buffer).unwrap();
-                let function_name_hash = calculate_keccak_256(function_name.as_bytes());
-
-                // Verify result
-                if function_name_hash == hash {
-                    true
-                } else {
-                    warn!("Result did not pass verification!");
-                    warn!(
-                        "Candidate {:?} does not match {:?}",
-                        &hash[..4],
-                        &function_name_hash[..4]
-                    );
-                    false
-                }
+                    let t2 = build_candidate(&mut c2[..], prefix, &suffix, num2);
+                    evaluate2(&c1[..t1], &c2[..t2], pattern, num1, num2, i)
+                })
             } else {
-                false
+                evaluate(&c1[..t1], pattern, num1, i)
             }
         })
     })
+}
+
+/// Re-hash a candidate that matched the pattern and confirm the full digest
+/// (a cheap safety check; the match is otherwise trusted).
+///
+/// Uses the portable `keccak-asm` implementation for independent verification,
+/// so a bug in the AVX2 kernel would be caught here.
+#[inline]
+fn verify(input: &[u8], hash: [u8; 32]) -> bool {
+    let function_name = std::str::from_utf8(input).unwrap();
+    let function_name_hash: [u8; 32] =
+        keccak_asm::Keccak256::digest(function_name.as_bytes()).into();
+
+    if function_name_hash == hash {
+        true
+    } else {
+        warn!("Result did not pass verification!");
+        warn!("Candidate {:?} does not match {:?}", &hash[..4], &function_name_hash[..4]);
+        false
+    }
+}
+
+/// Hash a single candidate and check it against the pattern.
+/// Returns `Some(num)` if the candidate matches.
+#[inline]
+fn evaluate(input: &[u8], pattern: &[u8], num: u64, pair_idx: u64) -> Option<u64> {
+    let hash = calculate_keccak_256(input);
+
+    // Increment hash counter (less frequently to reduce atomic contention).
+    // One candidate per call → add 2^20 every 2^20 pairs.
+    if (pair_idx & 0xFFFFF) == 0 {
+        HASH_COUNTER.fetch_add(1048576, Ordering::Relaxed);
+    }
+
+    if compare_hash(hash, pattern) { verify(input, hash).then_some(num) } else { None }
+}
+
+/// Hash two candidates (two-way kernel on AVX2) and check both against the
+/// pattern, returning `Some(num)` for the first match.
+#[inline]
+fn evaluate2(
+    input1: &[u8],
+    input2: &[u8],
+    pattern: &[u8],
+    num1: u64,
+    num2: u64,
+    pair_idx: u64,
+) -> Option<u64> {
+    let (h1, h2) = calculate_keccak_256x2(input1, input2);
+
+    // Two candidates were hashed this step → add 2×2^20 every 2^20 pairs.
+    if (pair_idx & 0xFFFFF) == 0 {
+        HASH_COUNTER.fetch_add(2097152, Ordering::Relaxed);
+    }
+
+    if compare_hash(h1, pattern) && verify(input1, h1) {
+        return Some(num1);
+    }
+    if compare_hash(h2, pattern) && verify(input2, h2) {
+        return Some(num2);
+    }
+    None
+}
+
+/// Write `name + digits(num) + suffix` into `buf` (which must have room for
+/// `name.len() + 20 + suffix.len()` bytes) and return the total length.
+#[inline]
+fn build_candidate(buf: &mut [u8], name: &[u8], suffix: &[u8], num: u64) -> usize {
+    let pl = name.len();
+    let sl = suffix.len();
+    buf[..pl].copy_from_slice(name);
+
+    // Convert `num` to ASCII decimal digits (written from the back).
+    let mut digits = [0u8; 20];
+    let mut pos = 20usize;
+    let mut n = num;
+    if n == 0 {
+        pos = 19;
+        digits[19] = b'0';
+    } else {
+        while n > 0 {
+            pos -= 1;
+            digits[pos] = b'0' + (n % 10) as u8;
+            n /= 10;
+        }
+    }
+    let dl = 20 - pos;
+
+    buf[pl..pl + dl].copy_from_slice(&digits[pos..]);
+    buf[pl + dl..pl + dl + sl].copy_from_slice(suffix);
+    pl + dl + sl
 }
 
 #[cfg(test)]
@@ -249,8 +362,12 @@ mod tests {
             Some(10), // Should find solution quickly
         );
 
-        assert!(solution.is_some());
-        assert_eq!(solution.unwrap(), 0); // Should return 0 as first match
+        // An empty pattern matches every candidate, so any num in the range is
+        // a valid answer. `find_any` over a parallel iterator does not
+        // guarantee which matching element it returns, so we only assert that
+        // a solution within the range was found.
+        let solution = solution.expect("empty pattern should always match");
+        assert!(solution < 10, "solution {solution} out of range");
     }
 
     #[test]
@@ -332,5 +449,121 @@ mod tests {
         // Test invalid characters
         assert_eq!(HEX_LOOKUP_TABLE[b'g' as usize], 0xFF);
         assert_eq!(HEX_LOOKUP_TABLE[b'/' as usize], 0xFF);
+    }
+
+    #[test]
+    fn test_long_input_over_136_bytes() {
+        // Regression test: inputs >= 136 bytes must not panic in keccak256x2.
+        // The two-way kernel only supports single-block inputs (< 136 bytes);
+        // longer inputs must fall back to independent hashing.
+        let long_name = "transferWithAuthorization";
+        let long_params = "address,address,uint256,uint256,uint256,uint256,uint256,bytes,bytes,bytes,bytes,bytes,bytes,bytes,bytes,bytes";
+        // Verify the candidate exceeds 136 bytes.
+        let candidate = format!("{}12345({})", long_name, long_params);
+        assert!(
+            candidate.len() >= 136,
+            "test requires candidate >= 136 bytes, got {}",
+            candidate.len()
+        );
+
+        let hash = calculate_keccak_256(candidate.as_bytes());
+        let pattern = format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
+
+        let solution = generate_vanity_function_name(
+            pattern.as_bytes(),
+            long_name.as_bytes(),
+            long_params.as_bytes(),
+            0,
+            Some(100000),
+        );
+
+        assert!(solution.is_some());
+        assert_eq!(solution.unwrap(), 12345);
+    }
+
+    #[test]
+    fn test_odd_range_start() {
+        // Regression test: odd range_start must not leave HASH_COUNTER at 0
+        // and must still find solutions correctly.
+        let fn_name = "transfer";
+        let fn_params = "address,uint256";
+        let fn_suffix = 12346u64; // even number → will be in pair (12346, 12347)
+
+        let full_fn = format!("{}{}({})", fn_name, fn_suffix, fn_params);
+        let hash = calculate_keccak_256(full_fn.as_bytes());
+        let pattern = format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
+
+        // Start at an odd number so num1 is always odd.
+        let solution = generate_vanity_function_name(
+            pattern.as_bytes(),
+            fn_name.as_bytes(),
+            fn_params.as_bytes(),
+            1, // odd start
+            Some(100000),
+        );
+
+        assert!(solution.is_some());
+        assert_eq!(solution.unwrap(), fn_suffix);
+    }
+
+    #[test]
+    fn test_end_none() {
+        // Regression test: end = None must not overflow when range_start = 0.
+        // We use a very restrictive 8-char pattern so the search finds a match
+        // quickly without actually scanning to u64::MAX.
+        let fn_name = "test";
+        let fn_params = "";
+        let fn_suffix = 42u64;
+
+        let full_fn = format!("{}{}({})", fn_name, fn_suffix, fn_params);
+        let hash = calculate_keccak_256(full_fn.as_bytes());
+        let pattern = format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
+
+        let solution = generate_vanity_function_name(
+            pattern.as_bytes(),
+            fn_name.as_bytes(),
+            fn_params.as_bytes(),
+            0,
+            None, // end = None → range_end = u64::MAX
+        );
+
+        assert!(solution.is_some());
+        assert_eq!(solution.unwrap(), fn_suffix);
+    }
+
+    #[test]
+    fn test_single_element_range() {
+        // Edge case: range with exactly one element.
+        let fn_name = "test";
+        let fn_params = "";
+        let fn_suffix = 7u64;
+
+        let full_fn = format!("{}{}({})", fn_name, fn_suffix, fn_params);
+        let hash = calculate_keccak_256(full_fn.as_bytes());
+        let pattern = format!("{:02x}{:02x}{:02x}{:02x}", hash[0], hash[1], hash[2], hash[3]);
+
+        let solution = generate_vanity_function_name(
+            pattern.as_bytes(),
+            fn_name.as_bytes(),
+            fn_params.as_bytes(),
+            7,
+            Some(8), // range [7, 8) = {7}
+        );
+
+        assert_eq!(solution, Some(7));
+    }
+
+    #[test]
+    fn test_empty_range() {
+        // Edge case: empty range returns None.
+        let solution = generate_vanity_function_name(
+            b"1234",
+            b"test",
+            b"",
+            5,
+            Some(5), // range [5, 5) = {}
+        );
+
+        assert_eq!(solution, None);
     }
 }

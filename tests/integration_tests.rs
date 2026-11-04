@@ -27,7 +27,7 @@ fn test_complete_workflow() {
 
     // Run the generator with a small range
     let solution = generate_vanity_function_name(
-        pattern[2..].as_bytes(),
+        &pattern.as_bytes()[2..],
         fn_name.as_bytes(),
         fn_params.as_bytes(),
         0,
