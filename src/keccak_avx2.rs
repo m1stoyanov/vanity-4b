@@ -12,9 +12,21 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use core::arch::x86_64::*;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Keccak-256 rate in bytes.
 pub const RATE: usize = 136;
+
+/// Monotonically increasing id assigned to each `TemplatedHasher`.
+///
+/// A thread-local candidate buffer is re-seeded from the template only when the
+/// digit count changes; that alone is not enough, because the buffer (and the
+/// last digit count) survive across separate `generate_vanity_function_name`
+/// calls on the same thread. Storing the creating hasher's id next to the
+/// buffer lets `hash_if_match` detect that the buffer was last written by a
+/// *different* hasher (e.g. a previous search with a different name) and
+/// re-copy the template, so a stale name is never hashed.
+static TEMPLATED_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 const RC: [u64; 24] = [
     0x1,
@@ -218,6 +230,50 @@ impl State {
         out[24..32].copy_from_slice(&(_mm256_extract_epi64::<2>(self.a01) as u64).to_le_bytes());
         out
     }
+
+    /// XOR a pre-padded single-block buffer (136 bytes, padding already applied)
+    /// into the state, reading only the non-zero words: `0..=fw` plus word 16
+    /// (the `0x80` domain pad). The rest of the block is zero.
+    #[inline(always)]
+    unsafe fn absorb_padded(&mut self, buf: *const u8, fw: usize) {
+        let wp = buf.cast::<u64>();
+        let mut i = 0usize;
+        while i <= fw {
+            let word = core::ptr::read_unaligned(wp.add(i));
+            self.xor_word(i, word);
+            i += 1;
+        }
+        if fw < 16 {
+            let word = core::ptr::read_unaligned(wp.add(16));
+            self.xor_word(16, word);
+        }
+    }
+
+    /// XOR a single rate word into its state register/lane (see `xor_words`).
+    #[inline(always)]
+    unsafe fn xor_word(&mut self, idx: usize, word: u64) {
+        let v = word as i64;
+        match idx {
+            0 => self.a00 = _mm256_xor_si256(self.a00, _mm256_set1_epi64x(v)),
+            1 => self.a01 = _mm256_xor_si256(self.a01, _mm256_set_epi64x(0, 0, 0, v)),
+            2 => self.a01 = _mm256_xor_si256(self.a01, _mm256_set_epi64x(0, 0, v, 0)),
+            3 => self.a01 = _mm256_xor_si256(self.a01, _mm256_set_epi64x(0, v, 0, 0)),
+            4 => self.a01 = _mm256_xor_si256(self.a01, _mm256_set_epi64x(v, 0, 0, 0)),
+            5 => self.a20 = _mm256_xor_si256(self.a20, _mm256_set_epi64x(0, v, 0, 0)),
+            6 => self.a11 = _mm256_xor_si256(self.a11, _mm256_set_epi64x(0, 0, 0, v)),
+            7 => self.a31 = _mm256_xor_si256(self.a31, _mm256_set_epi64x(0, 0, v, 0)),
+            8 => self.a21 = _mm256_xor_si256(self.a21, _mm256_set_epi64x(0, 0, v, 0)),
+            9 => self.a41 = _mm256_xor_si256(self.a41, _mm256_set_epi64x(v, 0, 0, 0)),
+            10 => self.a20 = _mm256_xor_si256(self.a20, _mm256_set_epi64x(0, 0, 0, v)),
+            11 => self.a21 = _mm256_xor_si256(self.a21, _mm256_set_epi64x(v, 0, 0, 0)),
+            12 => self.a11 = _mm256_xor_si256(self.a11, _mm256_set_epi64x(0, 0, v, 0)),
+            13 => self.a41 = _mm256_xor_si256(self.a41, _mm256_set_epi64x(0, 0, v, 0)),
+            14 => self.a31 = _mm256_xor_si256(self.a31, _mm256_set_epi64x(v, 0, 0, 0)),
+            15 => self.a20 = _mm256_xor_si256(self.a20, _mm256_set_epi64x(v, 0, 0, 0)),
+            16 => self.a31 = _mm256_xor_si256(self.a31, _mm256_set_epi64x(0, 0, 0, v)),
+            _ => {}
+        }
+    }
 }
 
 /// Compute Keccak-256 of `input` using AVX2.
@@ -280,6 +336,183 @@ pub fn is_avx2() -> bool {
     }
 }
 
+/// Powers of 10 for fast decimal digit counting.
+const POW10: [u64; 19] = [
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+    10_000_000_000,
+    100_000_000_000,
+    1_000_000_000_000,
+    10_000_000_000_000,
+    100_000_000_000_000,
+    1_000_000_000_000_000,
+    10_000_000_000_000_000,
+    100_000_000_000_000_000,
+    1_000_000_000_000_000_000,
+    10_000_000_000_000_000_000,
+];
+
+/// Number of decimal digits in `n` (1..=20).
+#[inline]
+pub fn digit_count(n: u64) -> usize {
+    let mut lo = 0usize;
+    let mut hi = POW10.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if n >= POW10[mid] {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo + 1
+}
+
+/// Write the decimal digits of `num` (exactly `d` of them) into
+/// `buf[name_len..name_len + d]`, most significant first.
+#[inline]
+pub fn write_digits(buf: &mut [u8], name_len: usize, num: u64, d: usize) {
+    let end = name_len + d;
+    let mut n = num;
+    let mut pos = end;
+    while n >= 100 {
+        let p = (n % 100) as u8;
+        buf[pos - 2] = b'0' + p / 10;
+        buf[pos - 1] = b'0' + p % 10;
+        pos -= 2;
+        n /= 100;
+    }
+    if n >= 10 {
+        buf[pos - 2] = b'0' + (n / 10) as u8;
+        buf[pos - 1] = b'0' + (n % 10) as u8;
+    } else {
+        buf[pos - 1] = b'0' + n as u8;
+    }
+}
+
+/// Pre-padded single-block Keccak templates: for each digit count `d` (1..=20),
+/// a 136-byte block = `name + [d zeros] + suffix` with Keccak padding applied.
+/// The digit positions are zero so [`write_digits`] can patch them in place.
+pub struct SingleBlockTemplates {
+    pub blocks: [[u8; 136]; 21],
+    pub fw: [usize; 21],
+}
+
+impl SingleBlockTemplates {
+    pub fn build(name: &[u8], suffix: &[u8]) -> Self {
+        let mut blocks = [[0u8; 136]; 21];
+        let mut fw = [0usize; 21];
+        for d in 1..=20usize {
+            let b = &mut blocks[d];
+            b[..name.len()].copy_from_slice(name);
+            let digits_end = name.len() + d;
+            b[digits_end..digits_end + suffix.len()].copy_from_slice(suffix);
+            let len = digits_end + suffix.len();
+            b[len] = 0x01; // 0x01 pad (original/Ethereum)
+            b[135] |= 0x80; // 0x80 domain pad
+            // Word index of the `0x01` pad byte (`len`), so `absorb_padded` reads
+            // through it. Using `len / 8` (not `(len - 1) / 8`) so the pad word is
+            // included even when `len` is a multiple of 8.
+            fw[d] = len / 8;
+        }
+        Self { blocks, fw }
+    }
+}
+
+/// Convert a hex pattern (1..8 chars) into a `(target, mask)` u32 pair so that
+/// `(prefix & mask) == target` tests the method-id prefix. The pattern's first
+/// character is the high nibble of the first hash byte (the least significant
+/// byte of the little-endian prefix u32).
+#[inline]
+pub fn pattern_to_target_mask(pattern: &[u8]) -> (u32, u32) {
+    let mut target = 0u32;
+    let mut mask = 0u32;
+    for (i, &c) in pattern.iter().enumerate() {
+        let v = crate::HEX_LOOKUP_TABLE[c as usize] as u32;
+        let shift = 8 * (i / 2) + (4 - 4 * (i % 2));
+        target |= v << shift;
+        mask |= 0xF << shift;
+    }
+    (target, mask)
+}
+
+/// A templated single-block Keccak-256 hasher: precomputes the padding for
+/// every digit count and patches only the digits per candidate, then checks the
+/// method-id prefix before squeezing the full digest.
+pub struct TemplatedHasher {
+    templates: SingleBlockTemplates,
+    target: u32,
+    mask: u32,
+    name_len: usize,
+    suffix_len: usize,
+    /// Id of this instance (see [`TEMPLATED_EPOCH`]).
+    epoch: u64,
+}
+
+impl TemplatedHasher {
+    pub fn new(name: &[u8], suffix: &[u8], pattern: &[u8]) -> Self {
+        let templates = SingleBlockTemplates::build(name, suffix);
+        let (target, mask) = pattern_to_target_mask(pattern);
+        let epoch = TEMPLATED_EPOCH.fetch_add(1, Ordering::Relaxed);
+        Self { templates, target, mask, name_len: name.len(), suffix_len: suffix.len(), epoch }
+    }
+
+    /// Id of this instance, stored alongside a thread-local buffer so a stale
+    /// buffer from a previous search is re-seeded.
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Total candidate length for `num` (for verification slices).
+    #[inline]
+    pub fn len(&self, num: u64) -> usize {
+        self.name_len + digit_count(num) + self.suffix_len
+    }
+
+    /// Hash `name + digits(num) + suffix`; return the full digest only if the
+    /// method-id prefix matches the pattern, else `None`.
+    ///
+    /// `buf` and `last_d` are per-thread scratch state reused across candidates
+    /// *and* across searches. `last_epoch` records which hasher last seeded the
+    /// buffer; the template is re-copied when either the hasher or the digit
+    /// count changed, so a buffer left over from an earlier search (different
+    /// name) is never hashed.
+    ///
+    /// # Safety
+    /// Must only be called when [`is_avx2`] is true.
+    #[target_feature(enable = "avx2")]
+    pub fn hash_if_match(
+        &self,
+        buf: &mut [u8; 136],
+        last_d: &mut usize,
+        last_epoch: &mut u64,
+        num: u64,
+    ) -> Option<[u8; 32]> {
+        let d = digit_count(num);
+        if *last_epoch != self.epoch || *last_d != d {
+            buf.copy_from_slice(&self.templates.blocks[d]);
+            *last_d = d;
+            *last_epoch = self.epoch;
+        }
+        write_digits(buf, self.name_len, num, d);
+        let mut s = unsafe { State::new() };
+        unsafe {
+            s.absorb_padded(buf.as_ptr(), self.templates.fw[d]);
+            s.permute();
+        }
+        let prefix = _mm256_extract_epi64::<0>(s.a00) as u32;
+        if (prefix & self.mask) == self.target { Some(unsafe { s.squeeze32() }) } else { None }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +554,158 @@ mod tests {
             assert_eq!(oa, ra, "lane A mismatch la={la}");
             assert_eq!(ob, rb, "lane B mismatch lb={lb}");
         }
+    }
+
+    #[test]
+    fn digit_count_and_write() {
+        for n in [
+            0u64,
+            1,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1000,
+            12345,
+            99_999,
+            100_000,
+            999_999,
+            1_000_000,
+            123_456_789,
+            999_999_999,
+            1_000_000_000,
+            12_345_678_901,
+            u64::MAX,
+        ] {
+            let d = digit_count(n);
+            assert_eq!(d, n.to_string().len(), "digit_count({n})");
+            let mut buf = [0u8; 40];
+            write_digits(&mut buf, 0, n, d);
+            let got = std::str::from_utf8(&buf[..d]).unwrap();
+            assert_eq!(got, n.to_string(), "write_digits({n})");
+        }
+    }
+
+    #[test]
+    fn pattern_to_target_mask_full() {
+        // Full 8-char pattern: all 32 bits masked, target = method id.
+        let (target, mask) = pattern_to_target_mask(b"a1b2c3d4");
+        assert_eq!(mask, 0xFFFF_FFFF);
+        // prefix little-endian: byte0=0xa1 (lsb) .. byte3=0xd4 (msb).
+        assert_eq!(target, 0xD4C3_B2A1);
+        // Partial pattern: only the first nibble of the first byte is masked.
+        let (t2, m2) = pattern_to_target_mask(b"a");
+        assert_eq!(m2, 0x0000_00F0);
+        assert_eq!(t2, 0x0000_00A0);
+        let (t3, m3) = pattern_to_target_mask(b"a1");
+        assert_eq!(m3, 0x0000_00FF);
+        assert_eq!(t3, 0x0000_00A1);
+        let (t4, m4) = pattern_to_target_mask(b"a1b");
+        assert_eq!(m4, 0x0000_F0FF);
+        assert_eq!(t4, 0x0000_B0A1);
+    }
+
+    #[test]
+    fn templated_matches_keccak_asm() {
+        if !is_avx2() {
+            eprintln!("skipping: no AVX2");
+            return;
+        }
+        let name = b"doSomething";
+        let suffix = b"(address)";
+        let hasher = TemplatedHasher::new(name, suffix, b""); // empty pattern: always match
+        let mut buf = [0u8; 136];
+        let mut last_d = 0;
+        let mut last_epoch = u64::MAX;
+        for num in [
+            0u64,
+            1,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1000,
+            12_345,
+            99_999_999,
+            100_000_000,
+            1_234_567_890,
+            12_345_678_901_234_567_890u64,
+            u64::MAX,
+        ] {
+            let h = unsafe { hasher.hash_if_match(&mut buf, &mut last_d, &mut last_epoch, num) }
+                .expect("empty pattern must match");
+            let candidate = format!("doSomething{num}(address)");
+            let ref_h: [u8; 32] = keccak_asm::Keccak256::digest(candidate.as_bytes()).into();
+            assert_eq!(h, ref_h, "templated mismatch num={num}");
+        }
+    }
+
+    #[test]
+    fn templated_prefix_match() {
+        if !is_avx2() {
+            eprintln!("skipping: no AVX2");
+            return;
+        }
+        let name = b"transfer";
+        let suffix = b"(address,uint256)";
+        let num = 12345u64;
+        let candidate = format!("transfer{num}(address,uint256)");
+        let h: [u8; 32] = keccak_asm::Keccak256::digest(candidate.as_bytes()).into();
+        let pattern = format!("{:02x}{:02x}{:02x}{:02x}", h[0], h[1], h[2], h[3]);
+        let hasher = TemplatedHasher::new(name, suffix, pattern.as_bytes());
+        let mut buf = [0u8; 136];
+        let mut last_d = 0;
+        let mut last_epoch = u64::MAX;
+        assert!(
+            unsafe { hasher.hash_if_match(&mut buf, &mut last_d, &mut last_epoch, num) }.is_some(),
+            "full 8-char pattern must match its own hash"
+        );
+        // A one-nibble pattern must also match. This is a fresh hasher (new
+        // epoch) reusing the same buffer; the epoch change must re-seed it.
+        let p1 = pattern.as_bytes()[0..1].to_vec();
+        let h1 = TemplatedHasher::new(name, suffix, &p1);
+        assert!(unsafe { h1.hash_if_match(&mut buf, &mut last_d, &mut last_epoch, num) }.is_some());
+    }
+
+    #[test]
+    fn templated_reseeds_buffer_on_hasher_change() {
+        if !is_avx2() {
+            eprintln!("skipping: no AVX2");
+            return;
+        }
+        // Two hashers with different names, sharing one buffer at the same digit
+        // count. The second hasher must re-seed the buffer with its own name
+        // (via the epoch change), not keep the first hasher's stale template.
+        // Without the epoch check the buffer would retain the first name and the
+        // second hasher would hash the wrong candidate.
+        let num = 12345u64; // 5 digits
+        let cand_a = format!("nameA{num}(p)");
+        let cand_b = format!("nameB{num}(p)");
+        let ha: [u8; 32] = keccak_asm::Keccak256::digest(cand_a.as_bytes()).into();
+        let hb: [u8; 32] = keccak_asm::Keccak256::digest(cand_b.as_bytes()).into();
+        assert_ne!(&ha[..4], &hb[..4], "test requires the two names to differ in the hash prefix");
+        // Pattern = first 4 bytes of name B's hash, so only name B can match.
+        let pattern = format!("{:02x}{:02x}{:02x}{:02x}", hb[0], hb[1], hb[2], hb[3]);
+        let mut buf = [0u8; 136];
+        let mut last_d = 0;
+        let mut last_epoch = u64::MAX;
+        let hasher_a = TemplatedHasher::new(b"nameA", b"(p)", pattern.as_bytes());
+        let hasher_b = TemplatedHasher::new(b"nameB", b"(p)", pattern.as_bytes());
+        // Hasher A seeds the buffer with its name; its candidate does not match.
+        assert!(
+            unsafe { hasher_a.hash_if_match(&mut buf, &mut last_d, &mut last_epoch, num) }
+                .is_none(),
+            "name A must not match name B's pattern"
+        );
+        // Hasher B reuses the buffer at the same digit count. The epoch change
+        // must re-seed it to name B, whose candidate matches.
+        assert!(
+            unsafe { hasher_b.hash_if_match(&mut buf, &mut last_d, &mut last_epoch, num) }
+                .is_some(),
+            "name B must match after the epoch re-seed (a stale buffer would fail this)"
+        );
     }
 
     #[test]

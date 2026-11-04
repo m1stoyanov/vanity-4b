@@ -26,6 +26,18 @@ thread_local! {
     static CAND2: std::cell::RefCell<Vec<u8>> = const { init_buf() };
 }
 
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    /// 136-byte buffer + last digit count + last hasher id for the templated AVX2
+    /// fast path. The pre-padded template is re-copied when the digit count
+    /// changes *or* the creating hasher is a new one (see `TemplatedHasher`
+    /// epoch), so a buffer left over from a previous search is re-seeded.
+    static TL_BUF1: std::cell::RefCell<([u8; 136], usize, u64)> =
+        const { std::cell::RefCell::new(([0u8; 136], 0, u64::MAX)) };
+    static TL_BUF2: std::cell::RefCell<([u8; 136], usize, u64)> =
+        const { std::cell::RefCell::new(([0u8; 136], 0, u64::MAX)) };
+}
+
 pub mod cli;
 
 pub const HEX_LOOKUP_TABLE: [u8; 256] = {
@@ -168,42 +180,91 @@ pub fn generate_vanity_function_name(
     suffix.extend_from_slice(parameters);
     suffix.push(b')');
 
-    // A u64 has at most 20 decimal digits, so the input never exceeds this.
-    let max_len = prefix.len() + 20 + suffix.len();
-
     let range_end = end.unwrap_or(u64::MAX);
     let count = range_end.saturating_sub(range_start);
     let n_pairs = count / 2 + count % 2;
 
-    // Process two consecutive candidates per step so the AVX2 two-way kernel
-    // can hash both in a single pass (faster than two separate hashes).
-    //
-    // We iterate over *pair indices* (0, 1, 2, …) because `StepBy<Range<u64>>`
-    // does not implement `IntoParallelIterator`. Candidate buffers are
-    // thread-local and reused, so no per-pair allocation or zeroing.
-    (0..n_pairs).into_par_iter().find_map_any(|i| {
-        let num1 = range_start + 2 * i;
-        let num2 = num1 + 1;
-        CAND1.with(|c1_cell| {
-            let mut c1 = c1_cell.borrow_mut();
-            if c1.len() < max_len {
-                c1.resize(max_len, 0);
-            }
-            let t1 = build_candidate(&mut c1[..], prefix, &suffix, num1);
-            if num2 < range_end {
-                CAND2.with(|c2_cell| {
-                    let mut c2 = c2_cell.borrow_mut();
-                    if c2.len() < max_len {
-                        c2.resize(max_len, 0);
-                    }
-                    let t2 = build_candidate(&mut c2[..], prefix, &suffix, num2);
-                    evaluate2(&c1[..t1], &c2[..t2], pattern, num1, num2, i)
-                })
-            } else {
-                evaluate(&c1[..t1], pattern, num1, i)
-            }
+    // Fast path: AVX2 + every candidate is a single Keccak block (< 136 bytes).
+    // The padding is precomputed per digit count, so only the digits are patched
+    // per candidate, and the method-id prefix is checked before squeezing the
+    // full digest. Falls back to the generic path elsewhere.
+    let use_templated: bool = {
+        #[cfg(target_arch = "x86_64")]
+        {
+            *AVX2.get_or_init(keccak_avx2::is_avx2) && prefix.len() + 20 + suffix.len() < 136
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    };
+
+    if use_templated {
+        let hasher = keccak_avx2::TemplatedHasher::new(prefix, &suffix, pattern);
+        (0..n_pairs).into_par_iter().find_map_any(|i| {
+            let num1 = range_start + 2 * i;
+            let num2 = num1 + 1;
+            TL_BUF1.with(|cell| {
+                let (buf1, last1, ep1) = &mut *cell.borrow_mut();
+                let h1 = unsafe { hasher.hash_if_match(buf1, last1, ep1, num1) };
+                if (i & 0xFFFFF) == 0 {
+                    let add = if num2 < range_end { 2_097_152 } else { 1_048_576 };
+                    HASH_COUNTER.fetch_add(add, Ordering::Relaxed);
+                }
+                if num2 < range_end {
+                    TL_BUF2.with(|cell2| {
+                        let (buf2, last2, ep2) = &mut *cell2.borrow_mut();
+                        let h2 = unsafe { hasher.hash_if_match(buf2, last2, ep2, num2) };
+                        if let Some(_h) = h1.filter(|h| verify_candidate(prefix, &suffix, num1, *h))
+                        {
+                            return Some(num1);
+                        }
+                        if let Some(_h) = h2.filter(|h| verify_candidate(prefix, &suffix, num2, *h))
+                        {
+                            return Some(num2);
+                        }
+                        None
+                    })
+                } else if let Some(h) = h1 {
+                    if verify_candidate(prefix, &suffix, num1, h) { Some(num1) } else { None }
+                } else {
+                    None
+                }
+            })
         })
-    })
+    } else {
+        // A u64 has at most 20 decimal digits, so the input never exceeds this.
+        let max_len = prefix.len() + 20 + suffix.len();
+        // Process two consecutive candidates per step so the AVX2 two-way kernel
+        // can hash both in a single pass (faster than two separate hashes).
+        //
+        // We iterate over *pair indices* (0, 1, 2, …) because `StepBy<Range<u64>>`
+        // does not implement `IntoParallelIterator`. Candidate buffers are
+        // thread-local and reused, so no per-pair allocation or zeroing.
+        (0..n_pairs).into_par_iter().find_map_any(|i| {
+            let num1 = range_start + 2 * i;
+            let num2 = num1 + 1;
+            CAND1.with(|c1_cell| {
+                let mut c1 = c1_cell.borrow_mut();
+                if c1.len() < max_len {
+                    c1.resize(max_len, 0);
+                }
+                let t1 = build_candidate(&mut c1[..], prefix, &suffix, num1);
+                if num2 < range_end {
+                    CAND2.with(|c2_cell| {
+                        let mut c2 = c2_cell.borrow_mut();
+                        if c2.len() < max_len {
+                            c2.resize(max_len, 0);
+                        }
+                        let t2 = build_candidate(&mut c2[..], prefix, &suffix, num2);
+                        evaluate2(&c1[..t1], &c2[..t2], pattern, num1, num2, i)
+                    })
+                } else {
+                    evaluate(&c1[..t1], pattern, num1, i)
+                }
+            })
+        })
+    }
 }
 
 /// Re-hash a candidate that matched the pattern and confirm the full digest
@@ -224,6 +285,19 @@ fn verify(input: &[u8], hash: [u8; 32]) -> bool {
         warn!("Candidate {:?} does not match {:?}", &hash[..4], &function_name_hash[..4]);
         false
     }
+}
+
+/// Rebuild `name + digits(num) + suffix` and verify `hash` against it with an
+/// independent keccak-asm digest. This is the safety net for the templated fast
+/// path: unlike hashing the thread-local buffer, it hashes a *freshly built*
+/// candidate, so a stale buffer left over from a previous search cannot cause a
+/// false positive. It only runs on a prefix match (~1 in 65536), so the
+/// per-call allocation is negligible.
+#[inline]
+fn verify_candidate(name: &[u8], suffix: &[u8], num: u64, hash: [u8; 32]) -> bool {
+    let mut buf = vec![0u8; name.len() + 20 + suffix.len()];
+    let total = build_candidate(&mut buf, name, suffix, num);
+    verify(&buf[..total], hash)
 }
 
 /// Hash a single candidate and check it against the pattern.
@@ -349,6 +423,53 @@ mod tests {
         let hash = calculate_keccak_256(function_name.as_bytes());
 
         assert_eq!(format!("{:02x}{:02x}", hash[0], hash[1]), "1234");
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn templated_reseeds_buffer_across_sequential_searches() {
+        if !crate::keccak_avx2::is_avx2() {
+            eprintln!("skipping: no AVX2");
+            return;
+        }
+        // A single-thread pool forces both searches onto the same thread, so the
+        // thread-local templated buffer (and its last digit count) survives from
+        // the first search into the second. Both searches stay within 6-digit
+        // numbers (100_000..1_000_000), so the second one starts at the same
+        // digit count the first one ended with: without the epoch re-seed it
+        // would hash the first (equal-length) name and miss every match.
+        let pool =
+            rayon::ThreadPoolBuilder::new().num_threads(1).build().expect("build a 1-thread pool");
+        pool.install(|| {
+            let matches = |name: &str, num: u64| {
+                let cand = format!("{name}{num}()");
+                let h = calculate_keccak_256(cand.as_bytes());
+                h[0] == 0x12 && h[1] == 0x34
+            };
+
+            let a = generate_vanity_function_name(
+                b"1234",
+                b"transfer(address)",
+                b"",
+                100_000,
+                Some(1_000_000),
+            )
+            .expect("first search finds a match");
+            assert!(matches("transfer(address)", a), "first result must match its name");
+
+            let b = generate_vanity_function_name(
+                b"1234",
+                b"approval(address)",
+                b"",
+                100_000,
+                Some(1_000_000),
+            )
+            .expect("second search finds a match");
+            assert!(
+                matches("approval(address)", b),
+                "second result must match its name, not the first search's stale template"
+            );
+        });
     }
 
     #[test]
