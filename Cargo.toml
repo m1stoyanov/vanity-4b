@@ -11,7 +11,7 @@ gumdrop = "0.8.1"
 log = { version = "0.4.26" }
 rayon = "1.10.0"
 num_cpus = "1.16.0"
-keccak-asm = { version = "0.1.4", default-features = false }
+keccak-asm = { version = "0.1.5", default-features = false }
 
 [profile.maxperf]
 codegen-units = 1
