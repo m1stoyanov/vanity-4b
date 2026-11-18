@@ -262,12 +262,12 @@ impl State {
             5 => self.a20 = _mm256_xor_si256(self.a20, _mm256_set_epi64x(0, v, 0, 0)),
             6 => self.a11 = _mm256_xor_si256(self.a11, _mm256_set_epi64x(0, 0, 0, v)),
             7 => self.a31 = _mm256_xor_si256(self.a31, _mm256_set_epi64x(0, 0, v, 0)),
-            8 => self.a21 = _mm256_xor_si256(self.a21, _mm256_set_epi64x(0, 0, v, 0)),
+            8 => self.a21 = _mm256_xor_si256(self.a21, _mm256_set_epi64x(0, v, 0, 0)),
             9 => self.a41 = _mm256_xor_si256(self.a41, _mm256_set_epi64x(v, 0, 0, 0)),
             10 => self.a20 = _mm256_xor_si256(self.a20, _mm256_set_epi64x(0, 0, 0, v)),
-            11 => self.a21 = _mm256_xor_si256(self.a21, _mm256_set_epi64x(v, 0, 0, 0)),
+            11 => self.a21 = _mm256_xor_si256(self.a21, _mm256_set_epi64x(0, 0, 0, v)),
             12 => self.a11 = _mm256_xor_si256(self.a11, _mm256_set_epi64x(0, 0, v, 0)),
-            13 => self.a41 = _mm256_xor_si256(self.a41, _mm256_set_epi64x(0, 0, v, 0)),
+            13 => self.a41 = _mm256_xor_si256(self.a41, _mm256_set_epi64x(0, v, 0, 0)),
             14 => self.a31 = _mm256_xor_si256(self.a31, _mm256_set_epi64x(v, 0, 0, 0)),
             15 => self.a20 = _mm256_xor_si256(self.a20, _mm256_set_epi64x(v, 0, 0, 0)),
             16 => self.a31 = _mm256_xor_si256(self.a31, _mm256_set_epi64x(0, 0, 0, v)),
@@ -723,6 +723,45 @@ mod tests {
             unsafe { keccak256(b"abc") },
             hex_to_bytes("4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
         );
+    }
+
+    #[test]
+    fn templated_long_names() {
+        if !is_avx2() {
+            eprintln!("skipping: no AVX2");
+            return;
+        }
+        // Long names so the 0x01 pad word lands in every rate word (fw = 8..16),
+        // covering the previously mis-laned words 8, 11, 13.
+        for (name, suffix) in [
+            (vec![b'a'; 60], "(address)"), // len 70..89  -> fw 8..11
+            (vec![b'b'; 85], "(address)"), // len 95..114 -> fw 11..14
+            (vec![b'c'; 100], "(address)"), // len 110..129 -> fw 13..16
+        ] {
+            let hasher = TemplatedHasher::new(&name, suffix.as_bytes(), b"");
+            let mut buf = [0u8; 136];
+            let mut last_d = 0;
+            let mut last_epoch = u64::MAX;
+            for num in [
+                0u64,
+                1,
+                9,
+                10,
+                99,
+                100,
+                999_999,
+                12_345_678_901,
+                999_999_999_999_999_999u64,
+                u64::MAX,
+            ] {
+                let d = digit_count(num);
+                let h = unsafe { hasher.hash_if_match(&mut buf, &mut last_d, &mut last_epoch, num) }
+                    .expect("empty pattern must match");
+                let candidate = format!("{}{num}{suffix}", String::from_utf8(name.clone()).unwrap());
+                let ref_h: [u8; 32] = keccak_asm::Keccak256::digest(candidate.as_bytes()).into();
+                assert_eq!(h, ref_h, "long-name templated mismatch d={d}");
+            }
+        }
     }
 
     fn hex_to_bytes(hex: &str) -> [u8; 32] {
